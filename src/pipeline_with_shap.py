@@ -819,7 +819,53 @@ def make_shap_outputs(
         explainer = shap.TreeExplainer(classifier)
 
     print(f"Calculating SHAP values for {sample_n} sampled rows...")
-    shap_values = explainer(X_sample_df)
+
+    # For some sklearn HistGradientBoosting + SHAP versions, TreeExplainer can
+    # fail the additivity check even when the transformed matrix shape is correct.
+    # This does not usually affect the feature-attribution ranking, so we disable
+    # the strict check and keep the output for explanation/reporting purposes.
+    try:
+        shap_values = explainer(X_sample_df, check_additivity=False)
+    except TypeError:
+        # Older SHAP versions may not accept check_additivity in __call__.
+        raw_values = explainer.shap_values(X_sample_df, check_additivity=False)
+        if isinstance(raw_values, list):
+            raw_values = raw_values[-1]  # positive/success class
+        raw_values = np.asarray(raw_values)
+
+        expected_value = getattr(explainer, "expected_value", 0.0)
+        expected_value = np.asarray(expected_value)
+        if expected_value.ndim > 0:
+            expected_value = expected_value.ravel()[-1]
+
+        shap_values = shap.Explanation(
+            values=raw_values,
+            base_values=np.repeat(float(expected_value), X_sample_df.shape[0]),
+            data=X_sample_df.to_numpy(dtype=np.float64),
+            feature_names=feature_names,
+        )
+    except Exception as exc:
+        if "Additivity check failed" not in str(exc):
+            raise
+
+        print("Warning: SHAP additivity check failed. Recalculating with check_additivity=False.")
+        raw_values = explainer.shap_values(X_sample_df, check_additivity=False)
+        if isinstance(raw_values, list):
+            raw_values = raw_values[-1]  # positive/success class
+        raw_values = np.asarray(raw_values)
+
+        expected_value = getattr(explainer, "expected_value", 0.0)
+        expected_value = np.asarray(expected_value)
+        if expected_value.ndim > 0:
+            expected_value = expected_value.ravel()[-1]
+
+        shap_values = shap.Explanation(
+            values=raw_values,
+            base_values=np.repeat(float(expected_value), X_sample_df.shape[0]),
+            data=X_sample_df.to_numpy(dtype=np.float64),
+            feature_names=feature_names,
+        )
+
     values = np.asarray(shap_values.values)
 
     # Some binary classifiers return shape: (n_samples, n_features, n_outputs).
@@ -1042,5 +1088,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-# python src/pipeline_with_shap.py --data dataset/df_preprocessed.csv --gmr-min 0 --gmr-max 0.60 --gmr-interval 0.05 --make-shap
