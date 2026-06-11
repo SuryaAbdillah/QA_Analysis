@@ -134,7 +134,6 @@ FEATURES = [
     "max_competitor_price",
 
     # competitor positioning
-    "price_order",
     "price_gap_avg_competitor",
     "price_gap_avg_competitor_pct",
     "price_gap_min_competitor",
@@ -1088,3 +1087,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# python src/pipeline_with_shap.py --data dataset/df_preprocessed.csv --gmr-min 0 --gmr-max 0.60 --gmr-interval 0.05 --make-shap
