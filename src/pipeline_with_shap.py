@@ -1,73 +1,90 @@
 """
-GMR Recommender Pipeline using HistGradientBoostingClassifier
-=============================================================
+GMR Recommender Pipeline + Saved Model Bundle + SHAP Explanation
+================================================================
 
 Purpose
 -------
-This script trains the selected/best win-probability model and recommends
-Gross Margin Rate (GMR) candidates using a user-defined GMR grid.
+This script trains the selected HistGradientBoosting win-probability model,
+saves a website-callable joblib bundle, recommends Gross Margin Rate (GMR)
+values from a user-defined grid, and optionally creates SHAP explanations.
 
-The recommendation is based on:
-    expected_profit = predicted_win_probability * candidate_estimated_gross_profit
+Main outputs
+------------
+output/final_gmr_recommender_model.joblib
+    A fitted sklearn Pipeline. Use this if your website already creates the
+    required feature columns.
 
-Main idea
----------
-For each quote/product row:
-1. Keep the estimated cost fixed.
-2. Simulate several candidate GMR values from the input grid.
-3. Recalculate price, subtotal, gross profit, grant ratio, and competitor gaps.
-4. Predict win probability for each candidate GMR.
-5. Recommend the GMR with the highest expected profit.
+output/final_gmr_recommender_bundle.joblib
+    Recommended for website usage. Contains:
+    - fitted sklearn Pipeline
+    - feature list
+    - categorical/numeric feature list
+    - model configuration
+    - default GMR grid used during training run
+    - expected target coding
 
-Default model
--------------
-The default model configuration is the initial HistGradientBoosting setup,
-because it performed better overall than the tuned setup in previous 5-fold CV,
-especially for recall, F1, PR-AUC, and Brier Score.
+output/gmr_recommendations.csv
+    Current vs recommended GMR per quote/product row.
+
+output/gmr_grid_summary_by_gmr.csv
+    Average predicted win probability and expected profit for each GMR candidate.
+
+Optional SHAP outputs when --make-shap is used:
+output/shap_global_feature_importance.csv
+output/shap_global_feature_importance.png
+output/shap_local_values_sample.csv
+output/shap_base_values_sample.csv
 
 How to run
 ----------
-From the project root, for example /QA_Analysis:
+From project root, for example /QA_Analysis:
 
-    python src/surya_gmr_recommender_pipeline.py \
-        --data dataset/df_preprocessed.csv \
-        --gmr-min 0 \
-        --gmr-max 0.60 \
-        --gmr-interval 0.05
-
-You can also enter GMR as percentages:
-
-    python src/surya_gmr_recommender_pipeline.py \
-        --data dataset/df_preprocessed.csv \
-        --gmr-min 0 \
-        --gmr-max 60 \
-        --gmr-interval 5
-
-Optional: require minimum predicted win probability before choosing a recommendation:
-
-    python src/surya_gmr_recommender_pipeline.py \
+    python src/surya_gmr_recommender_pipeline_with_shap.py \
         --data dataset/df_preprocessed.csv \
         --gmr-min 0 \
         --gmr-max 0.60 \
         --gmr-interval 0.05 \
-        --min-win-prob 0.50
+        --make-shap
 
-Outputs
--------
-output/gmr_recommendations.csv
-output/gmr_grid_scenarios.csv
-output/gmr_grid_summary_by_gmr.csv
-output/final_gmr_recommender_model.joblib
+You can also input GMR as percentages:
+
+    python src/surya_gmr_recommender_pipeline_with_shap.py \
+        --data dataset/df_preprocessed.csv \
+        --gmr-min 0 \
+        --gmr-max 60 \
+        --gmr-interval 5 \
+        --make-shap
+
+Website usage example
+---------------------
+
+    import joblib
+    import pandas as pd
+
+    bundle = joblib.load("output/final_gmr_recommender_bundle.joblib")
+    model = bundle["model"]
+    features = bundle["features"]
+
+    input_df = pd.read_csv("some_prepared_quote_features.csv")
+    win_prob = model.predict_proba(input_df[features])[:, 1]
+
+Important note
+--------------
+The saved sklearn Pipeline expects the same feature columns listed in
+bundle["features"]. For raw website input, apply the same feature engineering
+logic before calling predict_proba.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import warnings
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import joblib
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -134,8 +151,8 @@ FEATURES = [
 
 NUMERIC_FEATURES = [col for col in FEATURES if col not in CATEGORICAL_FEATURES]
 
-
-# Model selected as final based on previous model comparison.
+# Initial HGB was selected as final because it performed better overall than tuned HGB
+# in previous evaluation, especially in F1, PR-AUC, recall, and Brier Score.
 INITIAL_HGB_PARAMS: Dict[str, object] = {
     "max_iter": 300,
     "learning_rate": 0.05,
@@ -144,8 +161,7 @@ INITIAL_HGB_PARAMS: Dict[str, object] = {
     "random_state": RANDOM_STATE,
 }
 
-# Best params from RandomizedSearchCV. Kept as an option, but not default,
-# because previous evaluation showed the initial model had better overall balance.
+# Best params from RandomizedSearchCV. Kept as an optional config, not default.
 TUNED_HGB_PARAMS: Dict[str, object] = {
     "min_samples_leaf": 10,
     "max_leaf_nodes": 63,
@@ -192,11 +208,6 @@ def add_missing_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     for col in required_base_cols:
         if col not in df.columns:
             raise ValueError(f"Required column is missing: {col}")
-
-    competitor_cols = [
-        col for col in ["competitor_a", "competitor_b", "competitor_c"]
-        if col in df.columns
-    ]
 
     # Competitor raw columns fallback
     for col in ["competitor_a", "competitor_b", "competitor_c"]:
@@ -266,7 +277,6 @@ def add_missing_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
 
     # Competitor gap features
     df = recalculate_price_related_features(df)
-
     return df
 
 
@@ -390,8 +400,52 @@ def build_hgb_pipeline(model_config: str = "initial") -> Pipeline:
         raise ValueError("model_config must be either 'initial' or 'tuned'.")
 
     classifier = HistGradientBoostingClassifier(**params)
-
     return Pipeline(steps=[("preprocess", preprocess), ("classifier", classifier)])
+
+
+def save_model_bundle(
+    model: Pipeline,
+    output_dir: str,
+    model_config: str,
+    gmr_grid: np.ndarray,
+    min_win_prob: float,
+    objective: str,
+) -> Tuple[str, str]:
+    """Save both the fitted Pipeline and a richer bundle for website use."""
+    model_path = os.path.join(output_dir, "final_gmr_recommender_model.joblib")
+    bundle_path = os.path.join(output_dir, "final_gmr_recommender_bundle.joblib")
+
+    joblib.dump(model, model_path)
+
+    bundle = {
+        "model": model,
+        "features": FEATURES,
+        "categorical_features": CATEGORICAL_FEATURES,
+        "numeric_features": NUMERIC_FEATURES,
+        "target": TARGET,
+        "target_definition": "success = 1 when convert_to_order == 0; fail = 0 when convert_to_order == 1",
+        "model_name": "HistGradientBoostingClassifier",
+        "model_config": model_config,
+        "initial_hgb_params": INITIAL_HGB_PARAMS,
+        "tuned_hgb_params": TUNED_HGB_PARAMS,
+        "selected_hgb_params": INITIAL_HGB_PARAMS if model_config == "initial" else TUNED_HGB_PARAMS,
+        "gmr_grid": gmr_grid.tolist(),
+        "gmr_grid_pct": (gmr_grid * 100).round(4).tolist(),
+        "min_win_prob": min_win_prob,
+        "objective": objective,
+        "required_raw_columns_note": (
+            "For raw website input, create the same engineered columns before prediction. "
+            "The model pipeline expects input_df[features]."
+        ),
+    }
+    joblib.dump(bundle, bundle_path)
+
+    # JSON metadata is convenient for non-Python website parts.
+    metadata = {k: v for k, v in bundle.items() if k != "model"}
+    with open(os.path.join(output_dir, "final_gmr_recommender_metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, default=str)
+
+    return model_path, bundle_path
 
 
 # ============================================================
@@ -399,12 +453,7 @@ def build_hgb_pipeline(model_config: str = "initial") -> Pipeline:
 # ============================================================
 
 def normalize_gmr_input(value: float) -> float:
-    """
-    Accept both decimal and percentage style.
-    Examples:
-        0.30 -> 0.30
-        30   -> 0.30
-    """
+    """Accept both decimal and percentage style: 0.30 -> 0.30, 30 -> 0.30."""
     value = float(value)
     if abs(value) > 1:
         value = value / 100.0
@@ -419,16 +468,11 @@ def build_gmr_grid(gmr_min: float, gmr_max: float, gmr_interval: float) -> np.nd
 
     if gmr_interval <= 0:
         raise ValueError("gmr_interval must be positive.")
-
     if gmr_min > gmr_max:
         raise ValueError("gmr_min must be smaller than or equal to gmr_max.")
-
     if gmr_max >= 0.95:
-        raise ValueError(
-            "gmr_max must be lower than 0.95 because price = cost / (1 - GMR)."
-        )
+        raise ValueError("gmr_max must be lower than 0.95 because price = cost / (1 - GMR).")
 
-    # Add half interval to include the max due to floating point precision.
     grid = np.arange(gmr_min, gmr_max + (gmr_interval / 2), gmr_interval)
     grid = np.round(grid, 10)
     grid = grid[grid < 0.95]
@@ -445,7 +489,7 @@ def apply_candidate_gmr(base_df: pd.DataFrame, candidate_gmr: float) -> pd.DataF
 
     Assumption:
     - estimated_cost remains fixed
-    - new subtotal is calculated from GMR formula:
+    - new subtotal is calculated from:
           GMR = (Price - Cost) / Price
           Price = Cost / (1 - GMR)
     - unit_price is scaled according to subtotal change
@@ -457,7 +501,6 @@ def apply_candidate_gmr(base_df: pd.DataFrame, candidate_gmr: float) -> pd.DataF
     original_unit_price = pd.to_numeric(df["unit_price"], errors="coerce")
     estimated_cost = pd.to_numeric(df["estimated_cost"], errors="coerce")
 
-    # If estimated_cost is missing, recover it from current subtotal and current GMR.
     missing_cost = estimated_cost.isna()
     if missing_cost.any():
         estimated_cost = estimated_cost.where(
@@ -467,21 +510,15 @@ def apply_candidate_gmr(base_df: pd.DataFrame, candidate_gmr: float) -> pd.DataF
 
     new_subtotal = estimated_cost / (1 - candidate_gmr)
 
-    # Scale unit price with subtotal ratio to preserve the original row structure.
     scale = np.where(
         original_subtotal.notna() & (original_subtotal != 0),
         new_subtotal / original_subtotal,
         np.nan,
     )
-
     new_unit_price = original_unit_price * scale
 
-    # Fallback if subtotal scaling is unavailable.
-    fallback_unit_price = np.where(
-        pd.to_numeric(df["qty"], errors="coerce").notna() & (pd.to_numeric(df["qty"], errors="coerce") != 0),
-        new_subtotal / pd.to_numeric(df["qty"], errors="coerce"),
-        original_unit_price,
-    )
+    qty_num = pd.to_numeric(df["qty"], errors="coerce")
+    fallback_unit_price = np.where(qty_num.notna() & (qty_num != 0), new_subtotal / qty_num, original_unit_price)
     new_unit_price = np.where(pd.isna(new_unit_price), fallback_unit_price, new_unit_price)
 
     df["candidate_gmr"] = candidate_gmr
@@ -491,9 +528,7 @@ def apply_candidate_gmr(base_df: pd.DataFrame, candidate_gmr: float) -> pd.DataF
     df["estimated_cost"] = estimated_cost
     df["estimated_gross_profit"] = df["subtotal_price"] * candidate_gmr
 
-    df = recalculate_price_related_features(df)
-
-    return df
+    return recalculate_price_related_features(df)
 
 
 def create_gmr_scenarios(df_model: pd.DataFrame, gmr_grid: Iterable[float]) -> pd.DataFrame:
@@ -505,10 +540,7 @@ def create_gmr_scenarios(df_model: pd.DataFrame, gmr_grid: Iterable[float]) -> p
     base["current_subtotal_price"] = base["subtotal_price"]
     base["current_estimated_gross_profit"] = base["estimated_gross_profit"]
 
-    scenario_parts = []
-    for gmr in gmr_grid:
-        scenario_parts.append(apply_candidate_gmr(base, gmr))
-
+    scenario_parts = [apply_candidate_gmr(base, gmr) for gmr in gmr_grid]
     scenarios = pd.concat(scenario_parts, ignore_index=True)
 
     for col in NUMERIC_FEATURES:
@@ -523,22 +555,15 @@ def create_gmr_scenarios(df_model: pd.DataFrame, gmr_grid: Iterable[float]) -> p
 # Recommendation logic
 # ============================================================
 
-def add_predictions_and_expected_profit(
-    scenarios: pd.DataFrame,
-    model: Pipeline,
-) -> pd.DataFrame:
+def add_predictions_and_expected_profit(scenarios: pd.DataFrame, model: Pipeline) -> pd.DataFrame:
     """Predict win probability and expected profit for all GMR candidates."""
     scenarios = scenarios.copy()
     X_scenarios = scenarios[FEATURES].copy()
 
     scenarios["predicted_win_probability"] = model.predict_proba(X_scenarios)[:, 1]
-    scenarios["predicted_win_probability_pct"] = (
-        scenarios["predicted_win_probability"] * 100
-    ).round(2)
+    scenarios["predicted_win_probability_pct"] = (scenarios["predicted_win_probability"] * 100).round(2)
     scenarios["candidate_estimated_gross_profit"] = scenarios["estimated_gross_profit"]
-    scenarios["expected_profit"] = (
-        scenarios["predicted_win_probability"] * scenarios["candidate_estimated_gross_profit"]
-    )
+    scenarios["expected_profit"] = scenarios["predicted_win_probability"] * scenarios["candidate_estimated_gross_profit"]
 
     return scenarios
 
@@ -548,17 +573,9 @@ def select_recommendations(
     min_win_prob: float = 0.0,
     objective: str = "expected_profit",
 ) -> pd.DataFrame:
-    """
-    Select best candidate per row.
-
-    If min_win_prob is set, the script first tries to select among candidates
-    with predicted_win_probability >= min_win_prob. If no candidate passes the
-    threshold, it falls back to the best objective among all candidates.
-    """
+    """Select best GMR candidate per original row."""
     if objective not in {"expected_profit", "predicted_win_probability", "candidate_estimated_gross_profit"}:
-        raise ValueError(
-            "objective must be one of: expected_profit, predicted_win_probability, candidate_estimated_gross_profit"
-        )
+        raise ValueError("objective must be one of: expected_profit, predicted_win_probability, candidate_estimated_gross_profit")
 
     rows = []
     for row_id, group in scenarios.groupby("row_id", sort=False):
@@ -578,69 +595,40 @@ def select_recommendations(
         best_row["used_fallback_because_no_candidate_met_min_win_prob"] = used_fallback
         rows.append(best_row)
 
-    rec = pd.DataFrame(rows).reset_index(drop=True)
-    return rec
+    return pd.DataFrame(rows).reset_index(drop=True)
 
 
 def build_current_prediction_table(df_model: pd.DataFrame, model: Pipeline) -> pd.DataFrame:
-    """Generate current model predictions for current/original pricing."""
+    """Generate predictions for current/original pricing."""
     current = df_model.copy().reset_index(drop=True)
     current["row_id"] = np.arange(len(current))
     X_current = current[FEATURES].copy()
 
     current["current_predicted_win_probability"] = model.predict_proba(X_current)[:, 1]
-    current["current_predicted_win_probability_pct"] = (
-        current["current_predicted_win_probability"] * 100
-    ).round(2)
-    current["current_expected_profit"] = (
-        current["current_predicted_win_probability"] * current["estimated_gross_profit"]
-    )
+    current["current_predicted_win_probability_pct"] = (current["current_predicted_win_probability"] * 100).round(2)
+    current["current_expected_profit"] = current["current_predicted_win_probability"] * current["estimated_gross_profit"]
 
     keep_cols = [
-        "row_id",
-        "quote_id",
-        "product",
-        "product_model",
-        "kw",
-        "qty",
-        "unit_price",
-        "subtotal_price",
-        "gross_margin_rate",
-        "energy_grant_amount",
-        "estimated_cost",
-        "estimated_gross_profit",
-        "avg_competitor_price",
-        "price_gap_avg_competitor_pct",
-        "convert_to_order",
-        TARGET,
-        "current_predicted_win_probability",
-        "current_predicted_win_probability_pct",
+        "row_id", "quote_id", "product", "product_model", "kw", "qty",
+        "unit_price", "subtotal_price", "gross_margin_rate", "energy_grant_amount",
+        "estimated_cost", "estimated_gross_profit", "avg_competitor_price",
+        "price_gap_avg_competitor_pct", "convert_to_order", TARGET,
+        "current_predicted_win_probability", "current_predicted_win_probability_pct",
         "current_expected_profit",
     ]
     keep_cols = [col for col in keep_cols if col in current.columns]
     return current[keep_cols].copy()
 
 
-def format_recommendation_output(
-    recommendations: pd.DataFrame,
-    current_table: pd.DataFrame,
-) -> pd.DataFrame:
+def format_recommendation_output(recommendations: pd.DataFrame, current_table: pd.DataFrame) -> pd.DataFrame:
     """Create final recommendation table with current vs recommended comparison."""
     rec_keep = [
-        "row_id",
-        "candidate_gmr",
-        "unit_price",
-        "subtotal_price",
-        "candidate_estimated_gross_profit",
-        "predicted_win_probability",
-        "predicted_win_probability_pct",
-        "expected_profit",
-        "price_gap_avg_competitor_pct",
-        "higher_than_avg_competitor",
-        "is_lower_than_competitor",
-        "recommendation_objective",
-        "min_win_prob_constraint",
-        "used_fallback_because_no_candidate_met_min_win_prob",
+        "row_id", "candidate_gmr", "unit_price", "subtotal_price",
+        "candidate_estimated_gross_profit", "predicted_win_probability",
+        "predicted_win_probability_pct", "expected_profit",
+        "price_gap_avg_competitor_pct", "higher_than_avg_competitor",
+        "is_lower_than_competitor", "recommendation_objective",
+        "min_win_prob_constraint", "used_fallback_because_no_candidate_met_min_win_prob",
     ]
     rec_keep = [col for col in rec_keep if col in recommendations.columns]
 
@@ -661,51 +649,25 @@ def format_recommendation_output(
     out["delta_gmr"] = out["recommended_gmr"] - out["gross_margin_rate"]
     out["delta_unit_price"] = out["recommended_unit_price"] - out["unit_price"]
     out["delta_subtotal_price"] = out["recommended_subtotal_price"] - out["subtotal_price"]
-    out["delta_predicted_win_probability"] = (
-        out["recommended_predicted_win_probability"] - out["current_predicted_win_probability"]
-    )
-    out["delta_expected_profit"] = (
-        out["recommended_expected_profit"] - out["current_expected_profit"]
-    )
+    out["delta_predicted_win_probability"] = out["recommended_predicted_win_probability"] - out["current_predicted_win_probability"]
+    out["delta_expected_profit"] = out["recommended_expected_profit"] - out["current_expected_profit"]
 
-    # Percent helper columns for readability
     out["current_gmr_pct"] = (out["gross_margin_rate"] * 100).round(2)
     out["recommended_gmr_pct"] = (out["recommended_gmr"] * 100).round(2)
     out["delta_gmr_pct_point"] = (out["delta_gmr"] * 100).round(2)
-    out["delta_predicted_win_probability_pct_point"] = (
-        out["delta_predicted_win_probability"] * 100
-    ).round(2)
+    out["delta_predicted_win_probability_pct_point"] = (out["delta_predicted_win_probability"] * 100).round(2)
 
-    # Sort practical columns first
     first_cols = [
-        "quote_id",
-        "product",
-        "product_model",
-        "kw",
-        "qty",
-        "current_gmr_pct",
-        "recommended_gmr_pct",
-        "delta_gmr_pct_point",
-        "unit_price",
-        "recommended_unit_price",
-        "delta_unit_price",
-        "subtotal_price",
-        "recommended_subtotal_price",
-        "delta_subtotal_price",
-        "estimated_cost",
-        "estimated_gross_profit",
-        "recommended_estimated_gross_profit",
-        "current_predicted_win_probability_pct",
-        "recommended_predicted_win_probability_pct",
-        "delta_predicted_win_probability_pct_point",
-        "current_expected_profit",
-        "recommended_expected_profit",
-        "delta_expected_profit",
-        "avg_competitor_price",
-        "price_gap_avg_competitor_pct",
-        "recommended_price_gap_avg_competitor_pct",
-        "convert_to_order",
-        TARGET,
+        "quote_id", "product", "product_model", "kw", "qty",
+        "current_gmr_pct", "recommended_gmr_pct", "delta_gmr_pct_point",
+        "unit_price", "recommended_unit_price", "delta_unit_price",
+        "subtotal_price", "recommended_subtotal_price", "delta_subtotal_price",
+        "estimated_cost", "estimated_gross_profit", "recommended_estimated_gross_profit",
+        "current_predicted_win_probability_pct", "recommended_predicted_win_probability_pct",
+        "delta_predicted_win_probability_pct_point", "current_expected_profit",
+        "recommended_expected_profit", "delta_expected_profit",
+        "avg_competitor_price", "price_gap_avg_competitor_pct",
+        "recommended_price_gap_avg_competitor_pct", "convert_to_order", TARGET,
     ]
     first_cols = [col for col in first_cols if col in out.columns]
     remaining_cols = [col for col in out.columns if col not in first_cols]
@@ -730,10 +692,162 @@ def summarize_scenarios_by_gmr(scenarios: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
     summary["candidate_gmr_pct"] = (summary["candidate_gmr"] * 100).round(2)
-    summary["avg_predicted_win_probability_pct"] = (
-        summary["avg_predicted_win_probability"] * 100
-    ).round(2)
+    summary["avg_predicted_win_probability_pct"] = (summary["avg_predicted_win_probability"] * 100).round(2)
     return summary
+
+
+# ============================================================
+# SHAP explanation
+# ============================================================
+
+def get_transformed_feature_names(model: Pipeline) -> List[str]:
+    """Get feature names after preprocessing."""
+    preprocess = model.named_steps["preprocess"]
+    try:
+        names = preprocess.get_feature_names_out().tolist()
+    except Exception:
+        names = CATEGORICAL_FEATURES + NUMERIC_FEATURES
+
+    # Make names easier to read.
+    cleaned = []
+    for name in names:
+        name = str(name)
+        name = name.replace("cat__", "")
+        name = name.replace("num__", "")
+        cleaned.append(name)
+    return cleaned
+
+
+def make_shap_outputs(
+    model: Pipeline,
+    X: pd.DataFrame,
+    output_dir: str,
+    background_size: int = 300,
+    sample_size: int = 1000,
+    random_state: int = RANDOM_STATE,
+) -> None:
+    """
+    Create SHAP explanation outputs for the fitted HGB pipeline.
+
+    Note:
+    SHAP is calculated on the transformed feature matrix, because the model is
+    inside a sklearn Pipeline. The saved feature names are cleaned to match the
+    original feature names as much as possible.
+    """
+    try:
+        import shap
+    except ImportError as exc:
+        raise ImportError(
+            "SHAP is not installed. Please run: pip install shap"
+        ) from exc
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    preprocess = model.named_steps["preprocess"]
+    classifier = model.named_steps["classifier"]
+
+    rng = np.random.default_rng(random_state)
+    n_rows = len(X)
+    background_n = min(background_size, n_rows)
+    sample_n = min(sample_size, n_rows)
+
+    background_idx = rng.choice(n_rows, size=background_n, replace=False)
+    sample_idx = rng.choice(n_rows, size=sample_n, replace=False)
+
+    X_background_raw = X.iloc[background_idx].copy()
+    X_sample_raw = X.iloc[sample_idx].copy()
+
+    X_background = preprocess.transform(X_background_raw)
+    X_sample = preprocess.transform(X_sample_raw)
+
+    if hasattr(X_background, "toarray"):
+        X_background = X_background.toarray()
+    if hasattr(X_sample, "toarray"):
+        X_sample = X_sample.toarray()
+
+    feature_names = get_transformed_feature_names(model)
+
+    print("Creating SHAP explainer...")
+    # shap.Explainer will choose the best available explainer. For tree models,
+    # it usually uses a tree-based explainer; otherwise it falls back gracefully.
+    explainer = shap.Explainer(classifier, X_background, feature_names=feature_names)
+
+    print(f"Calculating SHAP values for {sample_n} sampled rows...")
+    shap_values = explainer(X_sample)
+    values = np.asarray(shap_values.values)
+
+    # Some binary classifiers return shape: (n_samples, n_features, n_outputs).
+    # If so, use the positive/success class when available.
+    if values.ndim == 3:
+        if values.shape[2] > 1:
+            values = values[:, :, 1]
+        else:
+            values = values[:, :, 0]
+
+    if values.ndim != 2:
+        raise ValueError(f"Unexpected SHAP value shape: {values.shape}")
+
+    mean_abs = np.abs(values).mean(axis=0)
+    importance = (
+        pd.DataFrame({
+            "feature": feature_names,
+            "mean_abs_shap": mean_abs,
+        })
+        .sort_values("mean_abs_shap", ascending=False)
+        .reset_index(drop=True)
+    )
+    importance["rank"] = np.arange(1, len(importance) + 1)
+
+    importance_path = os.path.join(output_dir, "shap_global_feature_importance.csv")
+    importance.to_csv(importance_path, index=False)
+
+    # Save local SHAP values for sample rows. This is useful for checking or for
+    # building simple explanation tables in a web app.
+    local_values = pd.DataFrame(values, columns=feature_names)
+    local_values.insert(0, "original_row_index", X.index[sample_idx])
+    local_path = os.path.join(output_dir, "shap_local_values_sample.csv")
+    local_values.to_csv(local_path, index=False)
+
+    # Save base values separately.
+    base_values = np.asarray(shap_values.base_values)
+    if base_values.ndim > 1:
+        base_values = base_values[:, -1]
+    base_df = pd.DataFrame({
+        "original_row_index": X.index[sample_idx],
+        "base_value": base_values,
+    })
+    base_path = os.path.join(output_dir, "shap_base_values_sample.csv")
+    base_df.to_csv(base_path, index=False)
+
+    # Simple global importance plot without relying on interactive JS.
+    top_n = min(20, len(importance))
+    plot_df = importance.head(top_n).sort_values("mean_abs_shap", ascending=True)
+
+    plt.figure(figsize=(10, max(5, top_n * 0.35)))
+    plt.barh(plot_df["feature"], plot_df["mean_abs_shap"])
+    plt.xlabel("Mean absolute SHAP value")
+    plt.ylabel("Feature")
+    plt.title("Global SHAP Feature Importance")
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, "shap_global_feature_importance.png")
+    plt.savefig(plot_path, dpi=200, bbox_inches="tight")
+    plt.close()
+
+    # Try saving explainer. This is convenient, but not required for deployment.
+    # If joblib fails, the CSV outputs are still available.
+    explainer_path = os.path.join(output_dir, "shap_explainer.joblib")
+    try:
+        joblib.dump(explainer, explainer_path)
+        print("Saved SHAP explainer:", explainer_path)
+    except Exception as exc:
+        print("Warning: could not save SHAP explainer object. CSV/PNG outputs were still saved.")
+        print("Reason:", str(exc))
+
+    print("SHAP outputs saved:")
+    print("-", importance_path)
+    print("-", plot_path)
+    print("-", local_path)
+    print("-", base_path)
 
 
 # ============================================================
@@ -741,44 +855,13 @@ def summarize_scenarios_by_gmr(scenarios: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="GMR recommender using HistGradientBoosting win-probability model.")
-    parser.add_argument(
-        "--data",
-        type=str,
-        default="dataset/df_preprocessed.csv",
-        help="Path to df_preprocessed.csv. Example: dataset/df_preprocessed.csv",
-    )
-    parser.add_argument(
-        "--gmr-min",
-        type=float,
-        required=True,
-        help="Minimum GMR. Accepts decimal 0.20 or percent 20.",
-    )
-    parser.add_argument(
-        "--gmr-max",
-        type=float,
-        required=True,
-        help="Maximum GMR. Accepts decimal 0.60 or percent 60.",
-    )
-    parser.add_argument(
-        "--gmr-interval",
-        type=float,
-        required=True,
-        help="GMR interval. Accepts decimal 0.05 or percent 5.",
-    )
-    parser.add_argument(
-        "--model-config",
-        type=str,
-        choices=["initial", "tuned"],
-        default="initial",
-        help="Use 'initial' HGB params or 'tuned' RandomizedSearchCV params. Default: initial.",
-    )
-    parser.add_argument(
-        "--min-win-prob",
-        type=float,
-        default=0.0,
-        help="Minimum predicted win probability constraint. Example: 0.50. Default: 0.0.",
-    )
+    parser = argparse.ArgumentParser(description="GMR recommender using HistGradientBoosting win-probability model with optional SHAP.")
+    parser.add_argument("--data", type=str, default="dataset/df_preprocessed.csv", help="Path to df_preprocessed.csv.")
+    parser.add_argument("--gmr-min", type=float, required=True, help="Minimum GMR. Accepts decimal 0.20 or percent 20.")
+    parser.add_argument("--gmr-max", type=float, required=True, help="Maximum GMR. Accepts decimal 0.60 or percent 60.")
+    parser.add_argument("--gmr-interval", type=float, required=True, help="GMR interval. Accepts decimal 0.05 or percent 5.")
+    parser.add_argument("--model-config", type=str, choices=["initial", "tuned"], default="initial", help="Default: initial.")
+    parser.add_argument("--min-win-prob", type=float, default=0.0, help="Minimum predicted win probability constraint. Default: 0.0.")
     parser.add_argument(
         "--objective",
         type=str,
@@ -786,17 +869,11 @@ def main() -> None:
         default="expected_profit",
         help="Objective used to choose recommended GMR. Default: expected_profit.",
     )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=OUTPUT_DIR,
-        help="Output directory. Default: output.",
-    )
-    parser.add_argument(
-        "--save-all-scenarios",
-        action="store_true",
-        help="Save all row_id x GMR scenarios. This can be large but useful for checking.",
-    )
+    parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR, help="Output directory. Default: output.")
+    parser.add_argument("--save-all-scenarios", action="store_true", help="Save all row_id x GMR scenarios.")
+    parser.add_argument("--make-shap", action="store_true", help="Create SHAP global/local explanation outputs.")
+    parser.add_argument("--shap-background-size", type=int, default=300, help="Rows used as SHAP background. Default: 300.")
+    parser.add_argument("--shap-sample-size", type=int, default=1000, help="Rows explained by SHAP. Default: 1000.")
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -823,8 +900,14 @@ def main() -> None:
     model = build_hgb_pipeline(model_config=args.model_config)
     model.fit(X, y)
 
-    model_path = os.path.join(args.output_dir, "final_gmr_recommender_model.joblib")
-    joblib.dump(model, model_path)
+    model_path, bundle_path = save_model_bundle(
+        model=model,
+        output_dir=args.output_dir,
+        model_config=args.model_config,
+        gmr_grid=gmr_grid,
+        min_win_prob=args.min_win_prob,
+        objective=args.objective,
+    )
 
     print("Creating GMR candidate scenarios...")
     scenarios = create_gmr_scenarios(df_model, gmr_grid)
@@ -853,25 +936,31 @@ def main() -> None:
     if args.save_all_scenarios:
         scenarios.to_csv(scenarios_path, index=False)
 
+    if args.make_shap:
+        make_shap_outputs(
+            model=model,
+            X=X,
+            output_dir=args.output_dir,
+            background_size=args.shap_background_size,
+            sample_size=args.shap_sample_size,
+            random_state=RANDOM_STATE,
+        )
+
     print("\nDone. Output files saved in:", os.path.abspath(args.output_dir))
     print("Main files:")
     print("-", rec_path)
     print("-", summary_path)
     print("-", model_path)
+    print("-", bundle_path)
+    print("-", os.path.join(args.output_dir, "final_gmr_recommender_metadata.json"))
     if args.save_all_scenarios:
         print("-", scenarios_path)
 
     print("\nTop 10 rows by delta_expected_profit:")
     preview_cols = [
-        "quote_id",
-        "product",
-        "current_gmr_pct",
-        "recommended_gmr_pct",
-        "current_predicted_win_probability_pct",
-        "recommended_predicted_win_probability_pct",
-        "current_expected_profit",
-        "recommended_expected_profit",
-        "delta_expected_profit",
+        "quote_id", "product", "current_gmr_pct", "recommended_gmr_pct",
+        "current_predicted_win_probability_pct", "recommended_predicted_win_probability_pct",
+        "current_expected_profit", "recommended_expected_profit", "delta_expected_profit",
     ]
     preview_cols = [col for col in preview_cols if col in final_recommendations.columns]
     print(
@@ -885,6 +974,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-# python src/gmr_recommender_pipeline.py --data dataset/df_preprocessed.csv --gmr-min 0 --gmr-max 0.60 --gmr-interval 0.05
