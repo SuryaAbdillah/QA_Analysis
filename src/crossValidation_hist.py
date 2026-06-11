@@ -612,7 +612,7 @@ def main() -> None:
     parser.add_argument(
         "--data",
         type=str,
-        default="../dataset/df_preprocessed.csv",
+        default="..\dataset\df_preprocessed.csv",
         help="Path to df_preprocessed.csv",
     )
     parser.add_argument(
