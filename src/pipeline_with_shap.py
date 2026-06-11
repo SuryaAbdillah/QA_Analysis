@@ -718,6 +718,38 @@ def get_transformed_feature_names(model: Pipeline) -> List[str]:
     return cleaned
 
 
+def _make_dense_float64(matrix, name: str = "matrix") -> np.ndarray:
+    """
+    Convert sklearn/ColumnTransformer output to a dense float64 numpy array.
+
+    This is needed because SHAP's tree backend requires numeric float arrays.
+    Some ColumnTransformer outputs can become dtype=object when categorical
+    encodings and passthrough numeric columns are combined.
+    """
+    if hasattr(matrix, "toarray"):
+        matrix = matrix.toarray()
+
+    matrix = np.asarray(matrix)
+
+    if matrix.dtype == object:
+        matrix = (
+            pd.DataFrame(matrix)
+            .apply(pd.to_numeric, errors="coerce")
+            .to_numpy(dtype=np.float64)
+        )
+    else:
+        matrix = matrix.astype(np.float64, copy=False)
+
+    # HistGradientBoosting can handle missing values, but SHAP's C extension is
+    # more stable with a contiguous numeric array.
+    matrix = np.ascontiguousarray(matrix)
+
+    if matrix.ndim != 2:
+        raise ValueError(f"{name} must be a 2D array, got shape {matrix.shape}")
+
+    return matrix
+
+
 def make_shap_outputs(
     model: Pipeline,
     X: pd.DataFrame,
@@ -729,10 +761,9 @@ def make_shap_outputs(
     """
     Create SHAP explanation outputs for the fitted HGB pipeline.
 
-    Note:
     SHAP is calculated on the transformed feature matrix, because the model is
-    inside a sklearn Pipeline. The saved feature names are cleaned to match the
-    original feature names as much as possible.
+    inside a sklearn Pipeline. The transformed matrix is explicitly converted to
+    float64 to avoid SHAP errors caused by dtype=object.
     """
     try:
         import shap
@@ -760,20 +791,35 @@ def make_shap_outputs(
     X_background = preprocess.transform(X_background_raw)
     X_sample = preprocess.transform(X_sample_raw)
 
-    if hasattr(X_background, "toarray"):
-        X_background = X_background.toarray()
-    if hasattr(X_sample, "toarray"):
-        X_sample = X_sample.toarray()
+    X_background = _make_dense_float64(X_background, name="X_background")
+    X_sample = _make_dense_float64(X_sample, name="X_sample")
 
     feature_names = get_transformed_feature_names(model)
+    if len(feature_names) != X_sample.shape[1]:
+        print(
+            "Warning: feature name length does not match transformed matrix. "
+            "Using generic feature names for SHAP output."
+        )
+        feature_names = [f"feature_{i}" for i in range(X_sample.shape[1])]
+
+    X_sample_df = pd.DataFrame(X_sample, columns=feature_names)
+    X_background_df = pd.DataFrame(X_background, columns=feature_names)
+
+    print("SHAP background matrix:", X_background_df.shape, X_background_df.dtypes.unique())
+    print("SHAP sample matrix:", X_sample_df.shape, X_sample_df.dtypes.unique())
 
     print("Creating SHAP explainer...")
-    # shap.Explainer will choose the best available explainer. For tree models,
-    # it usually uses a tree-based explainer; otherwise it falls back gracefully.
-    explainer = shap.Explainer(classifier, X_background, feature_names=feature_names)
+    # TreeExplainer is appropriate for HistGradientBoostingClassifier.
+    # The background data is already transformed and numeric.
+    try:
+        explainer = shap.Explainer(classifier, X_background_df, feature_names=feature_names)
+    except Exception as exc:
+        print("Warning: shap.Explainer with background failed. Trying TreeExplainer fallback.")
+        print("Reason:", str(exc))
+        explainer = shap.TreeExplainer(classifier)
 
     print(f"Calculating SHAP values for {sample_n} sampled rows...")
-    shap_values = explainer(X_sample)
+    shap_values = explainer(X_sample_df)
     values = np.asarray(shap_values.values)
 
     # Some binary classifiers return shape: (n_samples, n_features, n_outputs).
@@ -819,7 +865,7 @@ def make_shap_outputs(
     base_path = os.path.join(output_dir, "shap_base_values_sample.csv")
     base_df.to_csv(base_path, index=False)
 
-    # Simple global importance plot without relying on interactive JS.
+    # Global importance plot: mean absolute SHAP value.
     top_n = min(20, len(importance))
     plot_df = importance.head(top_n).sort_values("mean_abs_shap", ascending=True)
 
@@ -833,8 +879,28 @@ def make_shap_outputs(
     plt.savefig(plot_path, dpi=200, bbox_inches="tight")
     plt.close()
 
+    # SHAP beeswarm-style summary plot for direction and spread of feature effects.
+    # This is useful for reports because it shows whether a feature pushes the
+    # prediction upward or downward across many samples.
+    beeswarm_path = os.path.join(output_dir, "shap_summary_beeswarm.png")
+    try:
+        shap.summary_plot(
+            values,
+            X_sample_df,
+            feature_names=feature_names,
+            max_display=20,
+            show=False,
+        )
+        plt.tight_layout()
+        plt.savefig(beeswarm_path, dpi=200, bbox_inches="tight")
+        plt.close()
+    except Exception as exc:
+        print("Warning: could not save SHAP beeswarm plot.")
+        print("Reason:", str(exc))
+        beeswarm_path = None
+
     # Try saving explainer. This is convenient, but not required for deployment.
-    # If joblib fails, the CSV outputs are still available.
+    # If joblib fails, the CSV/PNG outputs are still available.
     explainer_path = os.path.join(output_dir, "shap_explainer.joblib")
     try:
         joblib.dump(explainer, explainer_path)
@@ -846,6 +912,8 @@ def make_shap_outputs(
     print("SHAP outputs saved:")
     print("-", importance_path)
     print("-", plot_path)
+    if beeswarm_path is not None:
+        print("-", beeswarm_path)
     print("-", local_path)
     print("-", base_path)
 
@@ -974,3 +1042,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# python src/pipeline_with_shap.py --data dataset/df_preprocessed.csv --gmr-min 0 --gmr-max 0.60 --gmr-interval 0.05 --make-shap
