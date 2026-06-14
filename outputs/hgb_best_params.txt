@@ -1,0 +1,12 @@
+Best refit metric: pr_auc
+Best CV score: 0.906406
+
+Best parameters:
+classifier__min_samples_leaf: 10
+classifier__max_leaf_nodes: 63
+classifier__max_iter: 400
+classifier__max_depth: None
+classifier__max_bins: 255
+classifier__learning_rate: 0.01
+classifier__l2_regularization: 0.0
+classifier__early_stopping: True

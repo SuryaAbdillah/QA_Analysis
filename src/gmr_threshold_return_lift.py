@@ -916,4 +916,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# python src/gmr_threshold_return_lift.py --data dataset/df_preprocessed.csv --bundle output/final_gmr_recommender_bundle.joblib --gmr-min 0 --gmr-max 0.60 --gmr-interval 0.05 --thresholds 0.60,0.75,0.90
+# python src/gmr_threshold_return_lift.py --data dataset/df_preprocessed.csv --bundle output/final_gmr_recommender_bundle.joblib --gmr-min 0 --gmr-max 0.60 --gmr-interval 0.05 --thresholds 0.60,0.70,0.80,0.90

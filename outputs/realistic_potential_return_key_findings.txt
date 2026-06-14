@@ -1,0 +1,12 @@
+Potential expected return lift from realistic model-based GMR recommendation
+=======================================================================
+
+Interpretation note:
+The figures below are model-based expected return simulations, not realized profit.
+Expected return = predicted win probability × estimated gross profit.
+The realistic simulation keeps estimated cost fixed and recalculates price, subtotal, competitor gap, grant ratio, and gross profit for each candidate GMR.
+
+With a minimum predicted win probability of 60%, the realistic GMR recommender gives a potential expected return lift of 387.54% among eligible quote/product rows (4,829/4,833 rows, 99.92% coverage). Assuming ineligible rows remain unchanged, the conservative portfolio-level lift is 387.58%. The average recommended GMR is 42.13% with an average predicted win probability of 81.96%.
+With a minimum predicted win probability of 70%, the realistic GMR recommender gives a potential expected return lift of 362.46% among eligible quote/product rows (4,763/4,833 rows, 98.55% coverage). Assuming ineligible rows remain unchanged, the conservative portfolio-level lift is 362.47%. The average recommended GMR is 37.58% with an average predicted win probability of 89.92%.
+With a minimum predicted win probability of 80%, the realistic GMR recommender gives a potential expected return lift of 334.63% among eligible quote/product rows (4,690/4,833 rows, 97.04% coverage). Assuming ineligible rows remain unchanged, the conservative portfolio-level lift is 334.49%. The average recommended GMR is 36.45% with an average predicted win probability of 92.59%.
+With a minimum predicted win probability of 90%, the realistic GMR recommender gives a potential expected return lift of 282.20% among eligible quote/product rows (4,569/4,833 rows, 94.54% coverage). Assuming ineligible rows remain unchanged, the conservative portfolio-level lift is 281.84%. The average recommended GMR is 34.04% with an average predicted win probability of 95.59%.
